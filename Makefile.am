@@ -6,4 +6,4 @@ lib_LTLIBRARIES = libremovelogo.la
 
 libremovelogo_la_SOURCES = src/removelogo.c
 
-libremovelogo_la_LDFLAGS = -no-undefined -avoid-version $(LIBAV_LIBS) $(PLUGINLDFLAGS)
+libremovelogo_la_LDFLAGS = -no-undefined -avoid-version $(PLUGINLDFLAGS)

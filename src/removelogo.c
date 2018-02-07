@@ -66,22 +66,13 @@
  * typical TV signal should make anything based on derivatives hopelessly noisy.
  */
 
-#include <stdint.h>     // for uint8_t
-#include <stdlib.h>     // for NULL, free, malloc
-#include <sys/errno.h>  // for ENOMEM, EINVAL
+#include <stdint.h>  // for uint8_t
+#include <stdlib.h>  // for NULL, free, malloc
 
-#include <vapoursynth/VSHelper.h>     // for VSMAX, VSMIN, isConstantFormat
-#include <vapoursynth/VapourSynth.h>  // for VSAPI, VSVideoInfo, VSMap, VSCore
+#include <vapoursynth/VSHelper.h>     // for VS_ALIGNED_FREE, VS_ALIGNED_MALLOC
+#include <vapoursynth/VapourSynth.h>  // for VSAPI, VSVideoInfo, VSFormat
 
-#include "libavcodec/avcodec.h"    // for av_init_packet, av_packet_unref
-#include "libavformat/avformat.h"  // for av_find_input_format, av_read_f...
-#include "libavutil/dict.h"        // for av_dict_free, av_dict_set, AVDi...
-#include "libavutil/error.h"       // for AVERROR
-#include "libavutil/frame.h"       // for AVFrame, av_frame_alloc, av_fra...
-#include "libavutil/imgutils.h"    // for av_image_alloc, av_image_copy
-#include "libavutil/mem.h"         // for av_freep, av_malloc_array, av_m...
-#include "libavutil/pixfmt.h"      // for AVPixelFormat, AVPixelFormat::A...
-#include "libswscale/swscale.h"    // for sws_freeContext, sws_getContext
+#define ALIGN 32
 
 typedef struct BoundingBox {
     int x1, x2, y1, y2;
@@ -116,6 +107,7 @@ static int calculate_bounding_box(BoundingBox *bbox, const uint8_t *data, int w,
     for (start_x = 0; start_x < w; start_x++)
         for (y = 0; y < h; y++)
             if ((data[y * w + start_x] > 0)) goto outl;
+
 outl:
     if (start_x == w)  // no points found
         return 0;
@@ -124,8 +116,8 @@ outl:
     for (end_x = w - 1; end_x >= start_x; end_x--)
         for (y = 0; y < h; y++)
             if ((data[y * w + end_x] > 0)) goto outr;
-outr:
 
+outr:
     // top bound
     line = data;
     for (start_y = 0; start_y < h; start_y++) {
@@ -133,8 +125,8 @@ outr:
             if (line[x] > 0) goto outt;
         line += w;
     }
-outt:
 
+outt:
     // bottom bound
     line = data + (h - 1) * w;
     for (end_y = h - 1; end_y >= start_y; end_y--) {
@@ -142,8 +134,8 @@ outt:
             if (line[x] > 0) goto outb;
         line -= w;
     }
-outb:
 
+outb:
     bbox->x1 = start_x;
     bbox->y1 = start_y;
     bbox->x2 = end_x;
@@ -151,127 +143,84 @@ outb:
     return 1;
 }
 
-static int load_image(uint8_t *data[4], int linesize[4], int *w, int *h,
-                      enum AVPixelFormat *pix_fmt, const char *filename,
-                      VSMap *out, const VSAPI *vsapi) {
-    AVInputFormat *iformat = NULL;
-    AVFormatContext *format_ctx = NULL;
-    AVCodec *codec;
-    AVCodecContext *codec_ctx;
-    AVCodecParameters *par;
-    AVFrame *frame;
-    int ret = 0;
-    AVPacket pkt;
-    AVDictionary *opt = NULL;
-
-    av_init_packet(&pkt);
-
-    av_register_all();
-
-    iformat = av_find_input_format("image2pipe");
-    if ((ret = avformat_open_input(&format_ctx, filename, iformat, NULL)) < 0) {
-        vsapi->setError(out, "RemoveLogo: failed to open input file");
-        return ret;
+static int load_mask(uint8_t **data, int *w, int *h, const char *filename,
+                     VSMap *out, VSCore *core, const VSAPI *vsapi) {
+    VSPlugin *imwri = vsapi->getPluginById("com.vapoursynth.imwri", core);
+    if (imwri == NULL) {
+        vsapi->setError(out, "RemoveLogo: imwri plugin not found");
+        return -1;
     }
 
-    if ((ret = avformat_find_stream_info(format_ctx, NULL)) < 0) {
-        vsapi->setError(out, "RemoveLogo: find stream info failed");
-        return ret;
+    VSMap *args = vsapi->createMap();
+    vsapi->propSetData(args, "filename", filename, -1, paReplace);
+
+    VSMap *image = vsapi->invoke(imwri, "Read", args);
+    vsapi->freeMap(args);
+    if (vsapi->getError(image)) {
+        vsapi->setError(out, vsapi->getError(image));
+        vsapi->freeMap(image);
+        return -1;
     }
 
-    par = format_ctx->streams[0]->codecpar;
-    codec = avcodec_find_decoder(par->codec_id);
-    if (!codec) {
-        vsapi->setError(out, "RemoveLogo: failed to find codec");
-        ret = AVERROR(EINVAL);
-        goto end;
+    VSNodeRef *node = vsapi->propGetNode(image, "clip", 0, NULL);
+    vsapi->freeMap(image);
+
+    const VSFormat *format = vsapi->getVideoInfo(node)->format;
+    if (format->colorFamily == cmGray || format->colorFamily == cmYUV ||
+        format->colorFamily == cmYCoCg) {
+        if (format->sampleType == stFloat) {
+            VSPlugin *resize =
+                vsapi->getPluginById("com.vapoursynth.resize", core);
+            vsapi->propSetNode(args, "clip", node, paReplace);
+            vsapi->freeNode(node);
+            vsapi->propSetInt(args, "format", pfGray8, paReplace);
+            image = vsapi->invoke(resize, "Bicubic", args);
+            vsapi->freeMap(args);
+            if (vsapi->getError(image)) {
+                vsapi->setError(out, vsapi->getError(image));
+                vsapi->freeMap(image);
+                vsapi->freeNode(node);
+                return -1;
+            }
+            node = vsapi->propGetNode(image, "clip", 0, NULL);
+            vsapi->freeMap(image);
+        }
+    } else if (format->colorFamily == cmRGB) {
+        VSPlugin *resize = vsapi->getPluginById("com.vapoursynth.resize", core);
+        vsapi->propSetNode(args, "clip", node, paReplace);
+        vsapi->freeNode(node);
+        vsapi->propSetInt(args, "format", pfYUV444P8, paReplace);
+        vsapi->propSetInt(args, "matrix", 7, paReplace);
+        image = vsapi->invoke(resize, "Bicubic", args);
+        vsapi->freeMap(args);
+        if (vsapi->getError(image)) {
+            vsapi->setError(out, vsapi->getError(image));
+            vsapi->freeMap(image);
+            vsapi->freeNode(node);
+            return -1;
+        }
+        node = vsapi->propGetNode(image, "clip", 0, NULL);
+        vsapi->freeMap(image);
+    } else {
+        vsapi->freeMap(image);
+        vsapi->freeNode(node);
+        vsapi->setError(out, "RemoveLogo: mask's color family is unsupported");
+        return -1;
+    }
+    const VSFrameRef *frame = vsapi->getFrame(0, node, NULL, 0);
+    vsapi->freeNode(node);
+    if (frame == NULL) {
+        vsapi->setError(out, "RemoveLogo: could not retrieve mask frame");
+        return -1;
     }
 
-    codec_ctx = avcodec_alloc_context3(codec);
-    if (!codec_ctx) {
-        vsapi->setError(out,
-                        "RemoveLogo: failed to alloc video decoder context");
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
-    ret = avcodec_parameters_to_context(codec_ctx, par);
-    if (ret < 0) {
-        vsapi->setError(
-            out,
-            "RemoveLogo: failed to copy codec parameters to decoder context");
-        goto end;
-    }
-
-    av_dict_set(&opt, "thread_type", "slice", 0);
-    if ((ret = avcodec_open2(codec_ctx, codec, &opt)) < 0) {
-        vsapi->setError(out, "RemoveLogo: failed to open codec");
-        goto end;
-    }
-
-    if (!(frame = av_frame_alloc())) {
-        vsapi->setError(out, "RemoveLogo: failed to alloc frame");
-        ret = AVERROR(ENOMEM);
-        goto end;
-    }
-
-    ret = av_read_frame(format_ctx, &pkt);
-    if (ret < 0) {
-        vsapi->setError(out, "RemoveLogo: failed to read frame from file");
-        goto end;
-    }
-
-    avcodec_send_packet(codec_ctx, &pkt);
-    ret = avcodec_receive_frame(codec_ctx, frame);
-    if (ret < 0) {
-        vsapi->setError(out, "RemoveLogo: failed to decode image from file");
-        goto end;
-    }
-
-    *w = frame->width;
-    *h = frame->height;
-    *pix_fmt = frame->format;
-
-    if ((ret = av_image_alloc(data, linesize, *w, *h, *pix_fmt, 16)) < 0)
-        goto end;
-    ret = 0;
-
-    av_image_copy(data, linesize, (const uint8_t **)frame->data,
-                  frame->linesize, *pix_fmt, *w, *h);
-
-end:
-    av_packet_unref(&pkt);
-    avcodec_free_context(&codec_ctx);
-    avformat_close_input(&format_ctx);
-    av_frame_free(&frame);
-    av_dict_free(&opt);
-
-    return ret;
-}
-
-static int scale_image(uint8_t *dst_data[4], int dst_stride[4], int dst_w,
-                       int dst_h, enum AVPixelFormat dst_pix_fmt,
-                       uint8_t *const src_data[4], int src_stride[4], int src_w,
-                       int src_h, enum AVPixelFormat src_pix_fmt) {
-    int ret;
-    struct SwsContext *sws_ctx =
-        sws_getContext(src_w, src_h, src_pix_fmt, dst_w, dst_h, dst_pix_fmt, 0,
-                       NULL, NULL, NULL);
-    if (!sws_ctx) {
-        ret = AVERROR(EINVAL);
-        goto end;
-    }
-
-    if ((ret = av_image_alloc(dst_data, dst_stride, dst_w, dst_h, dst_pix_fmt,
-                              16)) < 0)
-        goto end;
-    ret = 0;
-    sws_scale(sws_ctx, (const uint8_t *const *)src_data, src_stride, 0, src_h,
-              dst_data, dst_stride);
-
-end:
-    sws_freeContext(sws_ctx);
-    return ret;
+    *w = vsapi->getFrameWidth(frame, 0);
+    *h = vsapi->getFrameHeight(frame, 0);
+    VS_ALIGNED_MALLOC(data, *w * *h, ALIGN);
+    int stride = vsapi->getStride(frame, 0);
+    vs_bitblt(*data, stride, vsapi->getReadPtr(frame, 0), stride, *w, *h);
+    vsapi->freeFrame(frame);
+    return 0;
 }
 
 /**
@@ -366,34 +315,6 @@ static void convert_mask_to_strength_mask(uint8_t *data, int linesize, int w,
      * Apply the fudge factor to this number too, since we must ensure
      * that enough masks are generated. */
     *max_mask_size = apply_mask_fudge_factor(current_pass + 1);
-}
-
-static int load_mask(uint8_t **mask, int *w, int *h, const char *filename,
-                     VSMap *out, const VSAPI *vsapi) {
-    int ret;
-    enum AVPixelFormat pix_fmt;
-    uint8_t *src_data[4], *gray_data[4];
-    int src_stride[4], gray_linesize[4];
-
-    // load image from file
-    if ((ret = load_image(src_data, src_stride, w, h, &pix_fmt, filename, out,
-                          vsapi)) < 0)
-        return ret;
-
-    // convert the image to GRAY8 */
-    if ((ret = scale_image(gray_data, gray_linesize, *w, *h, AV_PIX_FMT_GRAY8,
-                           src_data, src_stride, *w, *h, pix_fmt)) < 0)
-        goto end;
-
-    // copy mask to a newly allocated array
-    *mask = av_malloc(*w * *h);
-    if (!*mask) ret = AVERROR(ENOMEM);
-    av_image_copy_plane(*mask, *w, gray_data[0], gray_linesize[0], *w, *h);
-
-end:
-    av_freep(&src_data[0]);
-    av_freep(&gray_data[0]);
-    return ret;
 }
 
 /**
@@ -588,20 +509,20 @@ static void VS_CC removeLogoFree(void *instanceData, VSCore *core,
     RemoveLogoData *d = (RemoveLogoData *)instanceData;
     int a, b;
 
-    av_freep(&d->full_mask_data);
-    av_freep(&d->half_mask_data);
+    VS_ALIGNED_FREE(d->full_mask_data);
+    VS_ALIGNED_FREE(d->half_mask_data);
 
     if (d->mask) {
         // Loop through each mask.
         for (a = 0; a <= d->max_mask_size; a++) {
             // Loop through each scanline in a mask.
             for (b = -a; b <= a; b++) {
-                av_freep(&d->mask[a][b + a]);  // Free a scanline.
+                VS_ALIGNED_FREE(d->mask[a][b + a]);  // Free a scanline.
             }
-            av_freep(&d->mask[a]);
+            VS_ALIGNED_FREE(d->mask[a]);
         }
         // Free the array of pointers pointing to the masks.
-        av_freep(&d->mask);
+        VS_ALIGNED_FREE(d->mask);
     }
     vsapi->freeNode(d->node);
     free(d);
@@ -638,7 +559,7 @@ static void VS_CC removeLogoCreate(const VSMap *in, VSMap *out, void *userData,
     int full_max_mask_size, half_max_mask_size;
 
     // Load our mask image.
-    if ((load_mask(&d.full_mask_data, &w, &h, filename, out, vsapi)) < 0) {
+    if (load_mask(&d.full_mask_data, &w, &h, filename, out, core, vsapi) < 0) {
         vsapi->freeNode(d.node);
         return;
     }
@@ -647,7 +568,8 @@ static void VS_CC removeLogoCreate(const VSMap *in, VSMap *out, void *userData,
                                   &full_max_mask_size);
 
     // Create the scaled down mask image for the chroma planes.
-    if (!(d.half_mask_data = av_mallocz(w / 2 * h / 2))) {
+    VS_ALIGNED_MALLOC(&d.half_mask_data, w / 2 * h / 2, ALIGN);
+    if (!d.half_mask_data) {
         vsapi->setError(out, "RemoveLogo: no memory");
         vsapi->freeNode(d.node);
         return;
@@ -661,7 +583,7 @@ static void VS_CC removeLogoCreate(const VSMap *in, VSMap *out, void *userData,
        the filter is applied, the mask size is determined on a pixel
        by pixel basis, with pixels nearer the edge of the logo getting
        smaller mask sizes. */
-    mask = (int ***)av_malloc_array(d.max_mask_size + 1, sizeof(int **));
+    VS_ALIGNED_MALLOC(&mask, (d.max_mask_size + 1) * sizeof(int **), ALIGN);
     if (!mask) {
         vsapi->setError(out, "RemoveLogo: no memory");
         vsapi->freeNode(d.node);
@@ -669,14 +591,15 @@ static void VS_CC removeLogoCreate(const VSMap *in, VSMap *out, void *userData,
     }
 
     for (a = 0; a <= d.max_mask_size; a++) {
-        mask[a] = (int **)av_malloc_array((a * 2) + 1, sizeof(int *));
+        VS_ALIGNED_MALLOC(&mask[a], ((a * 2) + 1) * sizeof(int *), ALIGN);
         if (!mask[a]) {
             vsapi->setError(out, "RemoveLogo: no memory");
             vsapi->freeNode(d.node);
             return;
         }
         for (b = -a; b <= a; b++) {
-            mask[a][b + a] = (int *)av_malloc_array((a * 2) + 1, sizeof(int));
+            VS_ALIGNED_MALLOC(&mask[a][b + a], ((a * 2) + 1) * sizeof(int),
+                              ALIGN);
             if (!mask[a][b + a]) {
                 vsapi->setError(out, "RemoveLogo: no memory");
                 vsapi->freeNode(d.node);

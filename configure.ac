@@ -9,7 +9,6 @@ AC_PROG_CC
 
 AC_CANONICAL_HOST
 
-PKG_CHECK_MODULES([LIBAV], [libavcodec libavformat libavutil libswscale])
 PKG_CHECK_MODULES([VAPOURSYNTH], [vapoursynth])
 
 AC_CONFIG_FILES([Makefile])
