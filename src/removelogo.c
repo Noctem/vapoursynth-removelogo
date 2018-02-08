@@ -81,17 +81,20 @@ typedef struct BoundingBox {
 typedef struct RemoveLogoData {
     VSNodeRef *node;
     const VSVideoInfo *vi;
-    const char *filename;
 
     /* Stores our collection of masks. The first is for an array of
        the second for the y axis, and the third for the x axis. */
     int ***mask;
     int max_mask_size;
 
-    uint8_t *full_mask_data;
-    BoundingBox full_mask_bbox;
-    uint8_t *half_mask_data;
-    BoundingBox half_mask_bbox;
+    uint8_t *luma_mask_data;
+    BoundingBox luma_mask_bbox;
+    uint8_t *chroma_mask_data;
+    BoundingBox chroma_mask_bbox;
+
+    int subSamplingW, subSamplingH;
+    int stride0, stride12;
+    int width, height;
 } RemoveLogoData;
 
 static int calculate_bounding_box(BoundingBox *bbox, const uint8_t *data, int w,
@@ -155,7 +158,6 @@ static int load_mask(uint8_t **data, int *w, int *h, const char *filename,
     vsapi->propSetData(args, "filename", filename, -1, paReplace);
 
     VSMap *image = vsapi->invoke(imwri, "Read", args);
-    vsapi->freeMap(args);
     if (vsapi->getError(image)) {
         vsapi->setError(out, vsapi->getError(image));
         vsapi->freeMap(image);
@@ -169,6 +171,7 @@ static int load_mask(uint8_t **data, int *w, int *h, const char *filename,
     if (format->colorFamily == cmGray || format->colorFamily == cmYUV ||
         format->colorFamily == cmYCoCg) {
         if (format->sampleType == stFloat) {
+            vsapi->clearMap(args);
             VSPlugin *resize =
                 vsapi->getPluginById("com.vapoursynth.resize", core);
             vsapi->propSetNode(args, "clip", node, paReplace);
@@ -179,29 +182,31 @@ static int load_mask(uint8_t **data, int *w, int *h, const char *filename,
             if (vsapi->getError(image)) {
                 vsapi->setError(out, vsapi->getError(image));
                 vsapi->freeMap(image);
-                vsapi->freeNode(node);
                 return -1;
             }
             node = vsapi->propGetNode(image, "clip", 0, NULL);
             vsapi->freeMap(image);
+        } else {
+            vsapi->freeMap(args);
         }
     } else if (format->colorFamily == cmRGB) {
+        vsapi->clearMap(args);
         VSPlugin *resize = vsapi->getPluginById("com.vapoursynth.resize", core);
         vsapi->propSetNode(args, "clip", node, paReplace);
         vsapi->freeNode(node);
         vsapi->propSetInt(args, "format", pfYUV444P8, paReplace);
-        vsapi->propSetInt(args, "matrix", 7, paReplace);
+        vsapi->propSetInt(args, "matrix", 8, paReplace);
         image = vsapi->invoke(resize, "Bicubic", args);
         vsapi->freeMap(args);
         if (vsapi->getError(image)) {
             vsapi->setError(out, vsapi->getError(image));
             vsapi->freeMap(image);
-            vsapi->freeNode(node);
             return -1;
         }
         node = vsapi->propGetNode(image, "clip", 0, NULL);
         vsapi->freeMap(image);
     } else {
+        vsapi->freeMap(args);
         vsapi->freeMap(image);
         vsapi->freeNode(node);
         vsapi->setError(out, "RemoveLogo: mask's color family is unsupported");
@@ -330,13 +335,14 @@ static void convert_mask_to_strength_mask(uint8_t *data, int linesize, int w,
  */
 static void generate_half_size_image(const uint8_t *src_data, int src_stride,
                                      uint8_t *dst_data, int dst_stride,
-                                     int src_w, int src_h, int *max_mask_size) {
+                                     int src_w, int src_h, int subW, int subH,
+                                     int *max_mask_size) {
     int x, y;
 
     /* Copy over the image data, using the average of 4 pixels for to
      * calculate each downsampled pixel. */
-    for (y = 0; y < src_h / 2; y++) {
-        for (x = 0; x < src_w / 2; x++) {
+    for (y = 0; y<src_h>> subH; y++) {
+        for (x = 0; x<src_w>> subW; x++) {
             /* Set the pixel if there exists a non-zero value in the
              * source pixels, else clear it. */
             dst_data[(y * dst_stride) + x] =
@@ -349,8 +355,8 @@ static void generate_half_size_image(const uint8_t *src_data, int src_stride,
         }
     }
 
-    convert_mask_to_strength_mask(dst_data, dst_stride, src_w / 2, src_h / 2, 0,
-                                  max_mask_size);
+    convert_mask_to_strength_mask(dst_data, dst_stride, src_w >> subW,
+                                  src_h >> subH, 0, max_mask_size);
 }
 
 /**
@@ -482,18 +488,17 @@ static const VSFrameRef *VS_CC removeLogoGetFrame(
 
         VSFrameRef *dst = vsapi->copyFrame(src, core);
 
-        blur_image(d->mask, vsapi->getReadPtr(src, 0), vsapi->getStride(src, 0),
-                   vsapi->getWritePtr(dst, 0), vsapi->getStride(dst, 0),
-                   d->full_mask_data, d->vi->width, d->vi->height,
-                   &d->full_mask_bbox);
-        blur_image(d->mask, vsapi->getReadPtr(src, 1), vsapi->getStride(src, 1),
-                   vsapi->getWritePtr(dst, 1), vsapi->getStride(dst, 1),
-                   d->half_mask_data, d->vi->width / 2, d->vi->height / 2,
-                   &d->half_mask_bbox);
-        blur_image(d->mask, vsapi->getReadPtr(src, 2), vsapi->getStride(src, 2),
-                   vsapi->getWritePtr(dst, 2), vsapi->getStride(dst, 2),
-                   d->half_mask_data, d->vi->width / 2, d->vi->height / 2,
-                   &d->half_mask_bbox);
+        blur_image(d->mask, vsapi->getReadPtr(src, 0), d->stride0,
+                   vsapi->getWritePtr(dst, 0), d->stride0, d->luma_mask_data,
+                   d->width, d->height, &d->luma_mask_bbox);
+        blur_image(d->mask, vsapi->getReadPtr(src, 1), d->stride12,
+                   vsapi->getWritePtr(dst, 1), d->stride12, d->chroma_mask_data,
+                   d->width >> d->subSamplingW, d->height >> d->subSamplingH,
+                   &d->chroma_mask_bbox);
+        blur_image(d->mask, vsapi->getReadPtr(src, 2), d->stride12,
+                   vsapi->getWritePtr(dst, 2), d->stride12, d->chroma_mask_data,
+                   d->width >> d->subSamplingW, d->height >> d->subSamplingH,
+                   &d->chroma_mask_bbox);
 
         vsapi->freeFrame(src);
 
@@ -509,8 +514,10 @@ static void VS_CC removeLogoFree(void *instanceData, VSCore *core,
     RemoveLogoData *d = (RemoveLogoData *)instanceData;
     int a, b;
 
-    VS_ALIGNED_FREE(d->full_mask_data);
-    VS_ALIGNED_FREE(d->half_mask_data);
+    VS_ALIGNED_FREE(d->luma_mask_data);
+    if (d->subSamplingW || d->subSamplingH) {
+        VS_ALIGNED_FREE(d->chroma_mask_data);
+    }
 
     if (d->mask) {
         // Loop through each mask.
@@ -556,28 +563,51 @@ static void VS_CC removeLogoCreate(const VSMap *in, VSMap *out, void *userData,
 
     int ***mask;
     int a, b, c, w, h;
-    int full_max_mask_size, half_max_mask_size;
+    int luma_max_mask_size, chroma_max_mask_size;
 
     // Load our mask image.
-    if (load_mask(&d.full_mask_data, &w, &h, filename, out, core, vsapi) < 0) {
+    if (load_mask(&d.luma_mask_data, &w, &h, filename, out, core, vsapi) < 0) {
         vsapi->freeNode(d.node);
         return;
     }
 
-    convert_mask_to_strength_mask(d.full_mask_data, w, w, h, 16,
-                                  &full_max_mask_size);
+    d.subSamplingW = d.vi->format->subSamplingW;
+    d.subSamplingH = d.vi->format->subSamplingH;
+    d.width = d.vi->width;
+    d.height = d.vi->height;
 
-    // Create the scaled down mask image for the chroma planes.
-    VS_ALIGNED_MALLOC(&d.half_mask_data, w / 2 * h / 2, ALIGN);
-    if (!d.half_mask_data) {
-        vsapi->setError(out, "RemoveLogo: no memory");
-        vsapi->freeNode(d.node);
-        return;
+    const VSFrameRef *frame = vsapi->getFrame(0, d.node, NULL, 0);
+    d.stride0 = vsapi->getStride(frame, 0);
+    d.stride12 = vsapi->getStride(frame, 1);
+    vsapi->freeFrame(frame);
+
+    convert_mask_to_strength_mask(d.luma_mask_data, d.stride0, w, h, 16,
+                                  &luma_max_mask_size);
+    /* Calculate our bounding rectangle, which determines in what
+     * region the logo resides for faster processing. */
+    calculate_bounding_box(&d.luma_mask_bbox, d.luma_mask_data, w, h);
+
+    if (d.subSamplingW || d.subSamplingH) {
+        // Create the scaled down mask image for the chroma planes.
+        VS_ALIGNED_MALLOC(&d.chroma_mask_data,
+                          (w >> d.subSamplingW) * (h >> d.subSamplingH), ALIGN);
+        if (!d.chroma_mask_data) {
+            vsapi->setError(out, "RemoveLogo: no memory");
+            vsapi->freeNode(d.node);
+            return;
+        }
+        generate_half_size_image(
+            d.luma_mask_data, d.stride0, d.chroma_mask_data, d.stride12, w, h,
+            d.subSamplingW, d.subSamplingH, &chroma_max_mask_size);
+        calculate_bounding_box(&d.chroma_mask_bbox, d.chroma_mask_data,
+                               w >> d.subSamplingW, h >> d.subSamplingH);
+
+        d.max_mask_size = VSMAX(luma_max_mask_size, chroma_max_mask_size);
+    } else {
+        d.chroma_mask_data = d.luma_mask_data;
+        d.chroma_mask_bbox = d.luma_mask_bbox;
+        d.max_mask_size = luma_max_mask_size;
     }
-    generate_half_size_image(d.full_mask_data, w, d.half_mask_data, w / 2, w, h,
-                             &half_max_mask_size);
-
-    d.max_mask_size = VSMAX(full_max_mask_size, half_max_mask_size);
 
     /* Create a circular mask for each size up to max_mask_size. When
        the filter is applied, the mask size is determined on a pixel
@@ -614,11 +644,6 @@ static void VS_CC removeLogoCreate(const VSMap *in, VSMap *out, void *userData,
         }
     }
     d.mask = mask;
-
-    /* Calculate our bounding rectangles, which determine in what
-     * region the logo resides for faster processing. */
-    calculate_bounding_box(&d.full_mask_bbox, d.full_mask_data, w, h);
-    calculate_bounding_box(&d.half_mask_bbox, d.half_mask_data, w / 2, h / 2);
 
     data = malloc(sizeof(d));
     *data = d;
