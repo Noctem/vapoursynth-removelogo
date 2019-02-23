@@ -73,6 +73,7 @@
 #include <vapoursynth/VapourSynth.h>  // for VSAPI, VSVideoInfo, VSFormat
 
 #define ALIGN 32
+#define THRESHOLD 17
 
 typedef struct BoundingBox {
     int x1, x2, y1, y2;
@@ -92,9 +93,8 @@ typedef struct RemoveLogoData {
     uint8_t *chroma_mask_data;
     BoundingBox chroma_mask_bbox;
 
-    int subSamplingW, subSamplingH;
-    int stride0, stride12;
-    int width, height;
+    int luma_stride, chroma_stride;
+    int chroma_height, chroma_width, height, width;
 } RemoveLogoData;
 
 static int calculate_bounding_box(BoundingBox *bbox, const uint8_t *data, int w,
@@ -146,8 +146,9 @@ outb:
     return 1;
 }
 
-static int load_mask(uint8_t **data, int *w, int *h, const char *filename,
-                     VSMap *out, VSCore *core, const VSAPI *vsapi) {
+static int load_mask(uint8_t **mask, int width, int height,
+                     const char *filename, VSMap *out, VSCore *core,
+                     const VSAPI *vsapi) {
     VSPlugin *imwri = vsapi->getPluginById("com.vapoursynth.imwri", core);
     if (imwri == NULL) {
         vsapi->setError(out, "RemoveLogo: imwri plugin not found");
@@ -212,6 +213,7 @@ static int load_mask(uint8_t **data, int *w, int *h, const char *filename,
         vsapi->setError(out, "RemoveLogo: mask's color family is unsupported");
         return -1;
     }
+
     const VSFrameRef *frame = vsapi->getFrame(0, node, NULL, 0);
     vsapi->freeNode(node);
     if (frame == NULL) {
@@ -219,11 +221,23 @@ static int load_mask(uint8_t **data, int *w, int *h, const char *filename,
         return -1;
     }
 
-    *w = vsapi->getFrameWidth(frame, 0);
-    *h = vsapi->getFrameHeight(frame, 0);
-    VS_ALIGNED_MALLOC(data, *w * *h, ALIGN);
+    if (width != vsapi->getFrameWidth(frame, 0) ||
+        height != vsapi->getFrameHeight(frame, 0)) {
+        vsapi->freeFrame(frame);
+        vsapi->setError(out, "RemoveLogo: mask dimensions do not match clip");
+        return -1;
+    }
+
     int stride = vsapi->getStride(frame, 0);
-    vs_bitblt(*data, stride, vsapi->getReadPtr(frame, 0), stride, *w, *h);
+
+    VS_ALIGNED_MALLOC(mask, width * height, ALIGN);
+    const uint8_t *srcp = vsapi->getReadPtr(frame, 0);
+
+    // copy all values above threshold into mask as ones
+    for (int y = 0; y < height; y++)
+        for (int x = 0; x < width; x++)
+            (*mask)[y * width + x] = srcp[y * stride + x] > THRESHOLD;
+
     vsapi->freeFrame(frame);
     return 0;
 }
@@ -238,7 +252,7 @@ static int load_mask(uint8_t **data, int *w, int *h, const char *filename,
  * opinion. This will calculate only at init-time, so you can put a
  * long expression here without effecting performance.
  */
-#define apply_mask_fudge_factor(x) (((x) >> 2) + (x))
+#define apply_mask_fudge_factor(x) (((x) >> 2) + x)
 
 /**
  * Pre-process an image to give distance information.
@@ -251,19 +265,13 @@ static int load_mask(uint8_t **data, int *w, int *h, const char *filename,
  * pythagorean distance since I'm using a modified erosion algorithm
  * to compute the distances.
  */
-static void convert_mask_to_strength_mask(uint8_t *data, int linesize, int w,
-                                          int h, int min_val,
+static void convert_mask_to_strength_mask(uint8_t *data, int width, int height,
                                           int *max_mask_size) {
     int x, y;
 
     /* How many times we've gone through the loop. Used in the
        in-place erosion algorithm and to get us max_mask_size later on. */
     int current_pass = 0;
-
-    // set all non-zero values to 1
-    for (y = 0; y < h; y++)
-        for (x = 0; x < w; x++)
-            data[y * linesize + x] = data[y * linesize + x] > min_val;
 
     /* For each pass, if a pixel is itself the same value as the
        current pass, and its four neighbors are too, then it is
@@ -274,12 +282,12 @@ static void convert_mask_to_strength_mask(uint8_t *data, int linesize, int w,
     while (1) {
         // If this doesn't get set by the end of this pass, then we're done.
         int has_anything_changed = 0;
-        uint8_t *current_pixel0 = data + 1 + linesize, *current_pixel;
+        uint8_t *current_pixel0 = data + 1 + width, *current_pixel;
         current_pass++;
 
-        for (y = 1; y < h - 1; y++) {
+        for (y = 1; y < height - 1; y++) {
             current_pixel = current_pixel0;
-            for (x = 1; x < w - 1; x++) {
+            for (x = 1; x < width - 1; x++) {
                 /* Apply the in-place erosion transform. It is based
                    on the following two premises:
                    1 - Any pixel that fails 1 erosion will fail all
@@ -293,8 +301,8 @@ static void convert_mask_to_strength_mask(uint8_t *data, int linesize, int w,
                 if (*current_pixel >= current_pass &&
                     *(current_pixel + 1) >= current_pass &&
                     *(current_pixel - 1) >= current_pass &&
-                    *(current_pixel + linesize) >= current_pass &&
-                    *(current_pixel - linesize) >= current_pass) {
+                    *(current_pixel + width) >= current_pass &&
+                    *(current_pixel - width) >= current_pass) {
                     /* Increment the value since it still has not been
                      * eroded, as evidenced by the if statement that
                      * just evaluated to true. */
@@ -303,17 +311,17 @@ static void convert_mask_to_strength_mask(uint8_t *data, int linesize, int w,
                 }
                 current_pixel++;
             }
-            current_pixel0 += linesize;
+            current_pixel0 += width;
         }
         if (!has_anything_changed) break;
     }
 
     /* Apply the fudge factor, which will increase the size of the
      * mask a little to reduce jitter at the cost of more blur. */
-    for (y = 1; y < h - 1; y++)
-        for (x = 1; x < w - 1; x++)
-            data[(y * linesize) + x] =
-                apply_mask_fudge_factor(data[(y * linesize) + x]);
+    for (y = 1; y < height - 1; y++)
+        for (x = 1; x < width - 1; x++)
+            data[(y * width) + x] =
+                apply_mask_fudge_factor(data[(y * width) + x]);
 
     /* As a side-effect, we now know the maximum mask size, which
      * we'll use to generate our masks.
@@ -333,30 +341,26 @@ static void convert_mask_to_strength_mask(uint8_t *data, int linesize, int w,
  * error could cause the filter to fail, but an upwards rounding error
  * will only cause a minor amount of excess blur in the chroma planes.
  */
-static void generate_half_size_image(const uint8_t *src_data, int src_stride,
-                                     uint8_t *dst_data, int dst_stride,
-                                     int src_w, int src_h, int subW, int subH,
+static void generate_half_size_image(const uint8_t *src_data, int src_w,
+                                     uint8_t *dst_data, int dst_w, int dst_h,
                                      int *max_mask_size) {
     int x, y;
 
     /* Copy over the image data, using the average of 4 pixels for to
      * calculate each downsampled pixel. */
-    for (y = 0; y<src_h>> subH; y++) {
-        for (x = 0; x<src_w>> subW; x++) {
+    for (y = 0; y < dst_h; y++) {
+        for (x = 0; x < dst_w; x++) {
             /* Set the pixel if there exists a non-zero value in the
              * source pixels, else clear it. */
-            dst_data[(y * dst_stride) + x] =
-                src_data[((y << 1) * src_stride) + (x << 1)] ||
-                src_data[((y << 1) * src_stride) + (x << 1) + 1] ||
-                src_data[(((y << 1) + 1) * src_stride) + (x << 1)] ||
-                src_data[(((y << 1) + 1) * src_stride) + (x << 1) + 1];
-            dst_data[(y * dst_stride) + x] =
-                VSMIN(1, dst_data[(y * dst_stride) + x]);
+            dst_data[(y * dst_w) + x] =
+                VSMIN(1, src_data[((y << 1) * src_w) + (x << 1)] ||
+                             src_data[((y << 1) * src_w) + (x << 1) + 1] ||
+                             src_data[(((y << 1) + 1) * src_w) + (x << 1)] ||
+                             src_data[(((y << 1) + 1) * src_w) + (x << 1) + 1]);
         }
     }
 
-    convert_mask_to_strength_mask(dst_data, dst_stride, src_w >> subW,
-                                  src_h >> subH, 0, max_mask_size);
+    convert_mask_to_strength_mask(dst_data, dst_w, dst_h, max_mask_size);
 }
 
 /**
@@ -444,26 +448,22 @@ static unsigned int blur_pixel(int ***mask, const uint8_t *mask_data,
  * copied to the output without change, and pixels inside the logo have the
  * de-blurring function applied.
  */
-static void blur_image(int ***mask, const uint8_t *src_data, int src_stride,
-                       uint8_t *dst_data, int dst_stride,
-                       const uint8_t *mask_data, int w, int h,
+static void blur_image(int ***mask, const uint8_t *src_data, uint8_t *dst_data,
+                       int stride, const uint8_t *mask_data, int w, int h,
                        BoundingBox *bbox) {
     int x, y;
     uint8_t *dst_line;
     const uint8_t *src_line;
 
     for (y = bbox->y1; y <= bbox->y2; y++) {
-        src_line = src_data + src_stride * y;
-        dst_line = dst_data + dst_stride * y;
+        src_line = src_data + stride * y;
+        dst_line = dst_data + stride * y;
 
         for (x = bbox->x1; x <= bbox->x2; x++) {
             if (mask_data[y * w + x]) {
                 // Only process if we are in the mask.
-                dst_line[x] = blur_pixel(mask, mask_data, dst_data, dst_stride,
-                                         w, h, x, y);
-            } else {
-                // Else just copy the data.
-                dst_line[x] = src_line[x];
+                dst_line[x] =
+                    blur_pixel(mask, mask_data, dst_data, stride, w, h, x, y);
             }
         }
     }
@@ -488,16 +488,16 @@ static const VSFrameRef *VS_CC removeLogoGetFrame(
 
         VSFrameRef *dst = vsapi->copyFrame(src, core);
 
-        blur_image(d->mask, vsapi->getReadPtr(src, 0), d->stride0,
-                   vsapi->getWritePtr(dst, 0), d->stride0, d->luma_mask_data,
-                   d->width, d->height, &d->luma_mask_bbox);
-        blur_image(d->mask, vsapi->getReadPtr(src, 1), d->stride12,
-                   vsapi->getWritePtr(dst, 1), d->stride12, d->chroma_mask_data,
-                   d->width >> d->subSamplingW, d->height >> d->subSamplingH,
+        blur_image(d->mask, vsapi->getReadPtr(src, 0),
+                   vsapi->getWritePtr(dst, 0), d->luma_stride,
+                   d->luma_mask_data, d->width, d->height, &d->luma_mask_bbox);
+        blur_image(d->mask, vsapi->getReadPtr(src, 1),
+                   vsapi->getWritePtr(dst, 1), d->chroma_stride,
+                   d->chroma_mask_data, d->chroma_width, d->chroma_height,
                    &d->chroma_mask_bbox);
-        blur_image(d->mask, vsapi->getReadPtr(src, 2), d->stride12,
-                   vsapi->getWritePtr(dst, 2), d->stride12, d->chroma_mask_data,
-                   d->width >> d->subSamplingW, d->height >> d->subSamplingH,
+        blur_image(d->mask, vsapi->getReadPtr(src, 2),
+                   vsapi->getWritePtr(dst, 2), d->chroma_stride,
+                   d->chroma_mask_data, d->chroma_width, d->chroma_height,
                    &d->chroma_mask_bbox);
 
         vsapi->freeFrame(src);
@@ -512,20 +512,18 @@ static const VSFrameRef *VS_CC removeLogoGetFrame(
 static void VS_CC removeLogoFree(void *instanceData, VSCore *core,
                                  const VSAPI *vsapi) {
     RemoveLogoData *d = (RemoveLogoData *)instanceData;
-    int a, b;
 
     VS_ALIGNED_FREE(d->luma_mask_data);
-    if (d->subSamplingW || d->subSamplingH) {
+    if (d->vi->format->subSamplingW || d->vi->format->subSamplingH)
         VS_ALIGNED_FREE(d->chroma_mask_data);
-    }
 
     if (d->mask) {
         // Loop through each mask.
-        for (a = 0; a <= d->max_mask_size; a++) {
+        for (int a = 0; a <= d->max_mask_size; a++) {
             // Loop through each scanline in a mask.
-            for (b = -a; b <= a; b++) {
+            for (int b = -a; b <= a; b++)
                 VS_ALIGNED_FREE(d->mask[a][b + a]);  // Free a scanline.
-            }
+
             VS_ALIGNED_FREE(d->mask[a]);
         }
         // Free the array of pointers pointing to the masks.
@@ -561,49 +559,54 @@ static void VS_CC removeLogoCreate(const VSMap *in, VSMap *out, void *userData,
         return;
     }
 
-    int ***mask;
-    int a, b, c, w, h;
     int luma_max_mask_size, chroma_max_mask_size;
 
+    d.height = d.vi->height;
+    d.width = d.vi->width;
+
     // Load our mask image.
-    if (load_mask(&d.luma_mask_data, &w, &h, filename, out, core, vsapi) < 0) {
+    if (load_mask(&d.luma_mask_data, d.width, d.height, filename, out, core,
+                  vsapi) < 0) {
         vsapi->freeNode(d.node);
         return;
     }
 
-    d.subSamplingW = d.vi->format->subSamplingW;
-    d.subSamplingH = d.vi->format->subSamplingH;
     d.width = d.vi->width;
     d.height = d.vi->height;
 
     const VSFrameRef *frame = vsapi->getFrame(0, d.node, NULL, 0);
-    d.stride0 = vsapi->getStride(frame, 0);
-    d.stride12 = vsapi->getStride(frame, 1);
+    d.luma_stride = vsapi->getStride(frame, 0);
+    d.chroma_stride = vsapi->getStride(frame, 1);
     vsapi->freeFrame(frame);
 
-    convert_mask_to_strength_mask(d.luma_mask_data, d.stride0, w, h, 16,
+    convert_mask_to_strength_mask(d.luma_mask_data, d.width, d.height,
                                   &luma_max_mask_size);
     /* Calculate our bounding rectangle, which determines in what
      * region the logo resides for faster processing. */
-    calculate_bounding_box(&d.luma_mask_bbox, d.luma_mask_data, w, h);
+    calculate_bounding_box(&d.luma_mask_bbox, d.luma_mask_data, d.width,
+                           d.height);
 
-    if (d.subSamplingW || d.subSamplingH) {
+    if (d.vi->format->subSamplingW || d.vi->format->subSamplingH) {
+        d.chroma_height = d.height >> d.vi->format->subSamplingH;
+        d.chroma_width = d.width >> d.vi->format->subSamplingW;
         // Create the scaled down mask image for the chroma planes.
-        VS_ALIGNED_MALLOC(&d.chroma_mask_data,
-                          (w >> d.subSamplingW) * (h >> d.subSamplingH), ALIGN);
+        VS_ALIGNED_MALLOC(&d.chroma_mask_data, d.chroma_width * d.chroma_height,
+                          ALIGN);
         if (!d.chroma_mask_data) {
             vsapi->setError(out, "RemoveLogo: no memory");
             vsapi->freeNode(d.node);
             return;
         }
-        generate_half_size_image(
-            d.luma_mask_data, d.stride0, d.chroma_mask_data, d.stride12, w, h,
-            d.subSamplingW, d.subSamplingH, &chroma_max_mask_size);
+        generate_half_size_image(d.luma_mask_data, d.width, d.chroma_mask_data,
+                                 d.chroma_width, d.chroma_height,
+                                 &chroma_max_mask_size);
         calculate_bounding_box(&d.chroma_mask_bbox, d.chroma_mask_data,
-                               w >> d.subSamplingW, h >> d.subSamplingH);
+                               d.chroma_width, d.chroma_height);
 
         d.max_mask_size = VSMAX(luma_max_mask_size, chroma_max_mask_size);
     } else {
+        d.chroma_height = d.height;
+        d.chroma_width = d.width;
         d.chroma_mask_data = d.luma_mask_data;
         d.chroma_mask_bbox = d.luma_mask_bbox;
         d.max_mask_size = luma_max_mask_size;
@@ -613,37 +616,36 @@ static void VS_CC removeLogoCreate(const VSMap *in, VSMap *out, void *userData,
        the filter is applied, the mask size is determined on a pixel
        by pixel basis, with pixels nearer the edge of the logo getting
        smaller mask sizes. */
-    VS_ALIGNED_MALLOC(&mask, (d.max_mask_size + 1) * sizeof(int **), ALIGN);
-    if (!mask) {
+    VS_ALIGNED_MALLOC(&d.mask, (d.max_mask_size + 1) * sizeof(int **), ALIGN);
+    if (!d.mask) {
         vsapi->setError(out, "RemoveLogo: no memory");
         vsapi->freeNode(d.node);
         return;
     }
 
-    for (a = 0; a <= d.max_mask_size; a++) {
-        VS_ALIGNED_MALLOC(&mask[a], ((a * 2) + 1) * sizeof(int *), ALIGN);
-        if (!mask[a]) {
+    for (int a = 0; a <= d.max_mask_size; a++) {
+        VS_ALIGNED_MALLOC(&d.mask[a], ((a * 2) + 1) * sizeof(int *), ALIGN);
+        if (!d.mask[a]) {
             vsapi->setError(out, "RemoveLogo: no memory");
             vsapi->freeNode(d.node);
             return;
         }
-        for (b = -a; b <= a; b++) {
-            VS_ALIGNED_MALLOC(&mask[a][b + a], ((a * 2) + 1) * sizeof(int),
+        for (int b = -a; b <= a; b++) {
+            VS_ALIGNED_MALLOC(&d.mask[a][b + a], ((a * 2) + 1) * sizeof(int),
                               ALIGN);
-            if (!mask[a][b + a]) {
+            if (!d.mask[a][b + a]) {
                 vsapi->setError(out, "RemoveLogo: no memory");
                 vsapi->freeNode(d.node);
                 return;
             }
-            for (c = -a; c <= a; c++) {
+            for (int c = -a; c <= a; c++) {
                 if ((b * b) + (c * c) <= (a * a))  // Circular 0/1 mask.
-                    mask[a][b + a][c + a] = 1;
+                    d.mask[a][b + a][c + a] = 1;
                 else
-                    mask[a][b + a][c + a] = 0;
+                    d.mask[a][b + a][c + a] = 0;
             }
         }
     }
-    d.mask = mask;
 
     data = malloc(sizeof(d));
     *data = d;
