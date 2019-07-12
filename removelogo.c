@@ -425,7 +425,7 @@ static unsigned int blur_pixel(int ***mask, const uint8_t *mask_data,
        the logo, so we have no data.  Else we need to normalise the
        data using the divisor. */
     return divisor == 0
-               ? 255
+               ? 128
                : (accumulator + (divisor / 2)) / divisor; /* divide, taking into
                                                              account average
                                                              rounding error */
@@ -448,15 +448,13 @@ static unsigned int blur_pixel(int ***mask, const uint8_t *mask_data,
  * copied to the output without change, and pixels inside the logo have the
  * de-blurring function applied.
  */
-static void blur_image(int ***mask, const uint8_t *src_data, uint8_t *dst_data,
-                       int stride, const uint8_t *mask_data, int w, int h,
+static void blur_image(int ***mask, uint8_t *dst_data, int stride,
+                       const uint8_t *mask_data, int w, int h,
                        BoundingBox *bbox) {
     int x, y;
     uint8_t *dst_line;
-    const uint8_t *src_line;
 
     for (y = bbox->y1; y <= bbox->y2; y++) {
-        src_line = src_data + stride * y;
         dst_line = dst_data + stride * y;
 
         for (x = bbox->x1; x <= bbox->x2; x++) {
@@ -488,15 +486,12 @@ static const VSFrameRef *VS_CC removeLogoGetFrame(
 
         VSFrameRef *dst = vsapi->copyFrame(src, core);
 
-        blur_image(d->mask, vsapi->getReadPtr(src, 0),
-                   vsapi->getWritePtr(dst, 0), d->luma_stride,
+        blur_image(d->mask, vsapi->getWritePtr(dst, 0), d->luma_stride,
                    d->luma_mask_data, d->width, d->height, &d->luma_mask_bbox);
-        blur_image(d->mask, vsapi->getReadPtr(src, 1),
-                   vsapi->getWritePtr(dst, 1), d->chroma_stride,
+        blur_image(d->mask, vsapi->getWritePtr(dst, 1), d->chroma_stride,
                    d->chroma_mask_data, d->chroma_width, d->chroma_height,
                    &d->chroma_mask_bbox);
-        blur_image(d->mask, vsapi->getReadPtr(src, 2),
-                   vsapi->getWritePtr(dst, 2), d->chroma_stride,
+        blur_image(d->mask, vsapi->getWritePtr(dst, 2), d->chroma_stride,
                    d->chroma_mask_data, d->chroma_width, d->chroma_height,
                    &d->chroma_mask_bbox);
 
@@ -505,7 +500,7 @@ static const VSFrameRef *VS_CC removeLogoGetFrame(
         return dst;
     }
 
-    return 0;
+    return NULL;
 }
 
 // Free all allocated data on filter destruction
@@ -561,8 +556,8 @@ static void VS_CC removeLogoCreate(const VSMap *in, VSMap *out, void *userData,
 
     int luma_max_mask_size, chroma_max_mask_size;
 
-    d.height = d.vi->height;
     d.width = d.vi->width;
+    d.height = d.vi->height;
 
     // Load our mask image.
     if (load_mask(&d.luma_mask_data, d.width, d.height, filename, out, core,
@@ -570,9 +565,6 @@ static void VS_CC removeLogoCreate(const VSMap *in, VSMap *out, void *userData,
         vsapi->freeNode(d.node);
         return;
     }
-
-    d.width = d.vi->width;
-    d.height = d.vi->height;
 
     const VSFrameRef *frame = vsapi->getFrame(0, d.node, NULL, 0);
     d.luma_stride = vsapi->getStride(frame, 0);
