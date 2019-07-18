@@ -66,9 +66,8 @@
  * typical TV signal should make anything based on derivatives hopelessly noisy.
  */
 
-#include <stdint.h>  // for uint8_t
-#include <stdlib.h>  // for NULL, free, malloc
-
+#include <stdint.h>                   // for uint8_t
+#include <stdlib.h>                   // for NULL, free, malloc
 #include <vapoursynth/VSHelper.h>     // for VS_ALIGNED_FREE, VS_ALIGNED_MALLOC
 #include <vapoursynth/VapourSynth.h>  // for VSAPI, VSVideoInfo, VSFormat
 
@@ -95,6 +94,7 @@ typedef struct RemoveLogoData {
 
     int luma_stride, chroma_stride;
     int chroma_height, chroma_width, height, width;
+    int luma_shift;
 } RemoveLogoData;
 
 static int calculate_bounding_box(BoundingBox *bbox, const uint8_t *data, int w,
@@ -503,6 +503,42 @@ static const VSFrameRef *VS_CC removeLogoGetFrame(
     return NULL;
 }
 
+static const VSFrameRef *VS_CC shiftLogoGetFrame(
+    int n, int activationReason, void **instanceData, void **frameData,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+    RemoveLogoData *d = (RemoveLogoData *)*instanceData;
+
+    if (activationReason == arInitial) {
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+    } else if (activationReason == arAllFramesReady) {
+        const VSFrameRef *src = vsapi->getFrameFilter(n, d->node, frameCtx);
+
+        VSFrameRef *dst = vsapi->copyFrame(src, core);
+
+        int x, y;
+        uint8_t *dstp = vsapi->getWritePtr(dst, 0);
+        uint8_t *dst_line;
+
+        for (y = d->luma_mask_bbox.y1; y <= d->luma_mask_bbox.y2; y++) {
+            dst_line = dstp + d->luma_stride * y;
+
+            for (x = d->luma_mask_bbox.x1; x <= d->luma_mask_bbox.x2; x++) {
+                if (d->luma_mask_data[y * d->width + x]) {
+                    // Only process if we are in the mask.
+                    dst_line[x] +=
+                        d->luma_shift - (d->luma_shift * (dst_line[x] / 255.0));
+                }
+            }
+        }
+
+        vsapi->freeFrame(src);
+
+        return dst;
+    }
+
+    return NULL;
+}
+
 // Free all allocated data on filter destruction
 static void VS_CC removeLogoFree(void *instanceData, VSCore *core,
                                  const VSAPI *vsapi) {
@@ -647,6 +683,131 @@ static void VS_CC removeLogoCreate(const VSMap *in, VSMap *out, void *userData,
                         core);
 }
 
+static void VS_CC shiftLogoCreate(const VSMap *in, VSMap *out, void *userData,
+                                  VSCore *core, const VSAPI *vsapi) {
+    RemoveLogoData d;
+    RemoveLogoData *data;
+
+    d.node = vsapi->propGetNode(in, "clip", 0, 0);
+    d.vi = vsapi->getVideoInfo(d.node);
+
+    // only handle 8bit integer formats
+    if (!isConstantFormat(d.vi) || d.vi->format->sampleType != stInteger ||
+        d.vi->format->bitsPerSample != 8) {
+        vsapi->setError(
+            out,
+            "ShiftLogo: only constant format 8bit integer input supported");
+        vsapi->freeNode(d.node);
+        return;
+    }
+
+    int err;
+    const char *filename = vsapi->propGetData(in, "filename", 0, &err);
+    if (err) {
+        vsapi->setError(out, "ShiftLogo: the bitmap file name is mandatory");
+        vsapi->freeNode(d.node);
+        return;
+    }
+
+    d.luma_shift = vsapi->propGetInt(in, "luma", 0, &err);
+    if (err) {
+        vsapi->setError(out, "ShiftLogo: the luma shift value is mandatory");
+        vsapi->freeNode(d.node);
+        return;
+    }
+
+    int luma_max_mask_size, chroma_max_mask_size;
+
+    d.width = d.vi->width;
+    d.height = d.vi->height;
+
+    // Load our mask image.
+    if (load_mask(&d.luma_mask_data, d.width, d.height, filename, out, core,
+                  vsapi) < 0) {
+        vsapi->freeNode(d.node);
+        return;
+    }
+
+    const VSFrameRef *frame = vsapi->getFrame(0, d.node, NULL, 0);
+    d.luma_stride = vsapi->getStride(frame, 0);
+    d.chroma_stride = vsapi->getStride(frame, 1);
+    vsapi->freeFrame(frame);
+
+    convert_mask_to_strength_mask(d.luma_mask_data, d.width, d.height,
+                                  &luma_max_mask_size);
+    /* Calculate our bounding rectangle, which determines in what
+     * region the logo resides for faster processing. */
+    calculate_bounding_box(&d.luma_mask_bbox, d.luma_mask_data, d.width,
+                           d.height);
+
+    if (d.vi->format->subSamplingW || d.vi->format->subSamplingH) {
+        d.chroma_height = d.height >> d.vi->format->subSamplingH;
+        d.chroma_width = d.width >> d.vi->format->subSamplingW;
+        // Create the scaled down mask image for the chroma planes.
+        VS_ALIGNED_MALLOC(&d.chroma_mask_data, d.chroma_width * d.chroma_height,
+                          ALIGN);
+        if (!d.chroma_mask_data) {
+            vsapi->setError(out, "ShiftLogo: no memory");
+            vsapi->freeNode(d.node);
+            return;
+        }
+        generate_half_size_image(d.luma_mask_data, d.width, d.chroma_mask_data,
+                                 d.chroma_width, d.chroma_height,
+                                 &chroma_max_mask_size);
+        calculate_bounding_box(&d.chroma_mask_bbox, d.chroma_mask_data,
+                               d.chroma_width, d.chroma_height);
+
+        d.max_mask_size = VSMAX(luma_max_mask_size, chroma_max_mask_size);
+    } else {
+        d.chroma_height = d.height;
+        d.chroma_width = d.width;
+        d.chroma_mask_data = d.luma_mask_data;
+        d.chroma_mask_bbox = d.luma_mask_bbox;
+        d.max_mask_size = luma_max_mask_size;
+    }
+
+    /* Create a circular mask for each size up to max_mask_size. When
+       the filter is applied, the mask size is determined on a pixel
+       by pixel basis, with pixels nearer the edge of the logo getting
+       smaller mask sizes. */
+    VS_ALIGNED_MALLOC(&d.mask, (d.max_mask_size + 1) * sizeof(int **), ALIGN);
+    if (!d.mask) {
+        vsapi->setError(out, "ShiftLogo: no memory");
+        vsapi->freeNode(d.node);
+        return;
+    }
+
+    for (int a = 0; a <= d.max_mask_size; a++) {
+        VS_ALIGNED_MALLOC(&d.mask[a], ((a * 2) + 1) * sizeof(int *), ALIGN);
+        if (!d.mask[a]) {
+            vsapi->setError(out, "ShiftLogo: no memory");
+            vsapi->freeNode(d.node);
+            return;
+        }
+        for (int b = -a; b <= a; b++) {
+            VS_ALIGNED_MALLOC(&d.mask[a][b + a], ((a * 2) + 1) * sizeof(int),
+                              ALIGN);
+            if (!d.mask[a][b + a]) {
+                vsapi->setError(out, "ShiftLogo: no memory");
+                vsapi->freeNode(d.node);
+                return;
+            }
+            for (int c = -a; c <= a; c++) {
+                if ((b * b) + (c * c) <= (a * a))  // Circular 0/1 mask.
+                    d.mask[a][b + a][c + a] = 1;
+                else
+                    d.mask[a][b + a][c + a] = 0;
+            }
+        }
+    }
+
+    data = malloc(sizeof(d));
+    *data = d;
+
+    vsapi->createFilter(in, out, "ShiftLogo", removeLogoInit, shiftLogoGetFrame,
+                        removeLogoFree, fmParallel, 0, data, core);
+}
+
 VS_EXTERNAL_API(void)
 VapourSynthPluginInit(VSConfigPlugin configFunc,
                       VSRegisterFunction registerFunc, VSPlugin *plugin) {
@@ -655,4 +816,6 @@ VapourSynthPluginInit(VSConfigPlugin configFunc,
                VAPOURSYNTH_API_VERSION, 1, plugin);
     registerFunc("RemoveLogo", "clip:clip;filename:data;", removeLogoCreate, 0,
                  plugin);
+    registerFunc("ShiftLogo", "clip:clip;filename:data;luma:int;",
+                 shiftLogoCreate, 0, plugin);
 }
