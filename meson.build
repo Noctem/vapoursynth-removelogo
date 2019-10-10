@@ -1,7 +1,7 @@
 project('removelogo', 'c',
     default_options: ['buildtype=release', 'b_ndebug=if-release'],
     meson_version: '>=0.46.0',
-    version: '0.2')
+    version: '1.0')
 
 shared_module('removelogo',
     sources: 'removelogo.c',

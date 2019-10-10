@@ -66,9 +66,8 @@
  * typical TV signal should make anything based on derivatives hopelessly noisy.
  */
 
-#include <stdint.h>  // for uint8_t
-#include <stdlib.h>  // for NULL, free, malloc
-
+#include <stdint.h>                   // for uint8_t
+#include <stdlib.h>                   // for NULL, free, malloc
 #include <vapoursynth/VSHelper.h>     // for VS_ALIGNED_FREE, VS_ALIGNED_MALLOC
 #include <vapoursynth/VapourSynth.h>  // for VSAPI, VSVideoInfo, VSFormat
 
